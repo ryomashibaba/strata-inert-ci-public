@@ -1,4 +1,4 @@
-name: Synthetic Windows owner proof (one-shot branch CI)
+name: Synthetic Windows owner-crash proof (one-shot)
 on:
   push:
     branches:
@@ -22,8 +22,8 @@ jobs:
       STRATA_INERT_ONLY: '1'
     steps:
       - uses: actions/checkout@v4
-      - name: Prove inert run-id claim and owned Windows Job
+      - name: Prove abrupt Job owner death contains child and grandchild
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          py -3 -I research/windows_job_inert_fixture.py
+          py -3 -I research/windows_job_inert_fixture.py --owner-crash
