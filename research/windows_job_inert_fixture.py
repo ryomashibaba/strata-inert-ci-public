@@ -253,7 +253,158 @@ def main():
     return 0
 
 
+
+def owner_crash_inert_controller():
+    """Prove kernel KILL_ON_JOB_CLOSE on abrupt owner death, NOT Docker cleanup."""
+    if (os.name != "nt" or os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("RUNNER_OS") != "Windows"
+            or os.environ.get("STRATA_INERT_ONLY") != "1"):
+        raise RuntimeError("HOLD_NOT_GITHUB_WINDOWS")
+    import threading
+    import queue
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k.WaitForSingleObject.restype = wintypes.DWORD
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.CloseHandle.restype = wintypes.BOOL
+    with tempfile.TemporaryDirectory(prefix="strata-owner-crash-inert-") as temp:
+        owner = subprocess.Popen(
+            [sys.executable, "-I", str(Path(__file__).resolve()),
+             "--owner-crash-owner", temp],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="ascii",
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        handles = []
+        try:
+            ready = queue.Queue(maxsize=1)
+            def read_ready():
+                try:
+                    ready.put(owner.stdout.readline())
+                except (OSError, ValueError):
+                    ready.put("")
+            threading.Thread(target=read_ready, daemon=True).start()
+            try:
+                flag = ready.get(timeout=14)
+            except queue.Empty:
+                raise RuntimeError("HOLD_OWNER_NOT_READY") from None
+            if flag.strip() != "OWNER_READY_AND_JOB_VERIFIED":
+                raise RuntimeError("HOLD_OWNER_NOT_VERIFIED")
+            for name in ("child.pid", "grandchild.pid"):
+                raw = (Path(temp) / name).read_text(encoding="ascii")
+                if not raw.isdecimal() or len(raw) > 10:
+                    raise RuntimeError("HOLD_INVALID_PID_MARKER")
+                handle = k.OpenProcess(0x00100000, False, int(raw))
+                if not handle:
+                    raise RuntimeError("HOLD_CHILD_HANDLE_UNAVAILABLE")
+                handles.append(handle)
+                if k.WaitForSingleObject(handle, 0) != 258:
+                    raise RuntimeError("HOLD_CHILD_NOT_ALIVE_PRE_CRASH")
+            # EXACT owned Popen; never terminate by name, global PID or process tree.
+            owner.kill()
+            owner.wait(timeout=8)
+            for handle in handles:
+                if k.WaitForSingleObject(handle, 8000) != 0:
+                    raise RuntimeError("HOLD_CHILD_SURVIVED_OWNER_CRASH")
+            print(json.dumps({
+                "schema": "strata-synthetic-job-owner-crash-v1",
+                "status": "SYNTHETIC_OWNER_DEATH_CONTAINED",
+                "owned_child_and_grandchild_exited": True,
+                "real_a26_integrated": False,
+                "docker_runs": 0, "model_requests": 0}, sort_keys=True))
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+                owner.wait(timeout=8)
+            for handle in handles:
+                k.CloseHandle(handle)
+
+
+def owner_crash_inert_owner(temp):
+    if os.environ.get("STRATA_INERT_ONLY") != "1":
+        raise RuntimeError("HOLD_NOT_INERT")
+    job = OwnedJob()
+    child_proc = None
+    try:
+        child_proc = subprocess.Popen(
+            [sys.executable, "-I", str(Path(__file__).resolve()),
+             "--owner-crash-child", temp],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+        job.assign_and_attest(child_proc)
+        if child_proc.poll() is not None or job.active() != 1:
+            raise RuntimeError("HOLD_UNVERIFIED_PRE_GO")
+        child_proc.stdin.write(b"GO\n")
+        child_proc.stdin.flush()
+        child_proc.stdin.close()
+        deadline = time.monotonic() + 10
+        k = job.k
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        while time.monotonic() < deadline:
+            p = Path(temp) / "grandchild.pid"
+            if p.is_file() and (Path(temp) / "child.pid").is_file():
+                raw = p.read_text(encoding="ascii")
+                if raw.isdecimal() and len(raw) <= 10:
+                    h = k.OpenProcess(0x1000, False, int(raw))
+                    if h:
+                        try:
+                            inside = wintypes.BOOL()
+                            if (job.active() >= 2 and k.IsProcessInJob(
+                                    h, job.handle, ctypes.byref(inside))
+                                    and inside.value):
+                                print("OWNER_READY_AND_JOB_VERIFIED", flush=True)
+                                time.sleep(40)
+                                return
+                        finally:
+                            k.CloseHandle(h)
+            time.sleep(.05)
+        raise RuntimeError("HOLD_GRANDCHILD_JOB_UNVERIFIED")
+    finally:
+        # Abrupt owner death bypasses this Python finally; the kernel closes
+        # the non-inherited Job handle and enforces KILL_ON_JOB_CLOSE.
+        job.close()
+        if child_proc is not None and child_proc.poll() is None:
+            child_proc.wait(timeout=8)
+
+
+def owner_crash_inert_child(temp):
+    if os.environ.get("STRATA_INERT_ONLY") != "1" or sys.stdin.buffer.readline(4) != b"GO\n":
+        raise RuntimeError("HOLD_NO_GO")
+    gc = subprocess.Popen([sys.executable, "-I", str(Path(__file__).resolve()),
+                           "--owner-crash-grandchild", temp],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+    (Path(temp) / "child.pid").write_text(str(os.getpid()), encoding="ascii")
+    time.sleep(40)
+
+
+def owner_crash_inert_grandchild(temp):
+    if os.environ.get("STRATA_INERT_ONLY") != "1":
+        raise RuntimeError("HOLD_NOT_INERT")
+    (Path(temp) / "grandchild.pid").write_text(str(os.getpid()), encoding="ascii")
+    time.sleep(40)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--owner-crash":
+        try:
+            owner_crash_inert_controller()
+        except Exception as exc:
+            reason = str(exc)
+            print(reason if reason.startswith("HOLD_") else "HOLD_UNCLASSIFIED")
+            sys.exit(1)
+        sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--owner-crash-owner":
+        owner_crash_inert_owner(sys.argv[2])
+        sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--owner-crash-child":
+        owner_crash_inert_child(sys.argv[2])
+        sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--owner-crash-grandchild":
+        owner_crash_inert_grandchild(sys.argv[2])
+        sys.exit(0)
     if len(sys.argv) == 2 and sys.argv[1] == "--child":
         sys.exit(child())
     if len(sys.argv) == 2 and sys.argv[1] == "--grandchild":
