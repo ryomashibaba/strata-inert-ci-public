@@ -1,0 +1,29 @@
+name: Synthetic Windows owner proof (one-shot branch CI)
+on:
+  push:
+    branches:
+      - research/a26-inert-windows-job-20261109
+    paths:
+      - .github/workflows/inert-owner-windows.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: strata-public-inert-one-shot
+  cancel-in-progress: false
+
+jobs:
+  synthetic-owned-job:
+    if: github.repository == 'ryomashibaba/strata-inert-ci-public' && github.ref == 'refs/heads/research/a26-inert-windows-job-20261109'
+    runs-on: windows-2022
+    timeout-minutes: 5
+    env:
+      STRATA_INERT_ONLY: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove inert run-id claim and owned Windows Job
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          py -3 -I research/windows_job_inert_fixture.py
